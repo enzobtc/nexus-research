@@ -20,7 +20,7 @@ import websocket
 from flask import Flask, jsonify
 
 app = Flask(__name__)
-VERSION = "1.0"
+VERSION = "1.1"
 SYMBOL = "BTC"
 POST_URL = os.getenv("NEXUS_MULTI_EXCHANGE_GATEWAY_URL", "").strip()
 NEXUS_SECRET = os.getenv("NEXUS_SECRET", "").strip()
@@ -34,6 +34,7 @@ PRICES = {}
 HEALTH = {}
 STARTED = False
 START_LOCK = threading.Lock()
+THREADS = {}
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "NEXUS-MULTI-EXCHANGE/1.0"})
 
@@ -279,30 +280,77 @@ def poster_loop():
         time.sleep(max(0.5,POST_INTERVAL))
 
 
+def _spawn_thread(key, target, args=()):
+    """Start a daemon worker only when its previous thread is missing/dead."""
+    t = THREADS.get(key)
+    if t is not None and t.is_alive():
+        return False
+    t = threading.Thread(target=target, args=args, daemon=True, name=key)
+    THREADS[key] = t
+    t.start()
+    return True
+
+
 def start_background():
+    """Idempotently ensure every collector + poster worker is alive.
+
+    Render Free may kill and recreate the Gunicorn worker after idle periods.
+    Calling this from /healthz makes a wake-up self-healing instead of leaving
+    an empty venues={} snapshot until the next manual redeploy.
+    """
     global STARTED
     with START_LOCK:
-        if STARTED: return
-        STARTED=True
-        jobs=[
+        STARTED = True
+        jobs = [
             ("bybit","wss://stream.bybit.com/v5/public/linear",bybit_open,bybit_msg),
             ("binance",BINANCE_URL,binance_open,binance_msg),
             ("okx",OKX_WS,okx_open,okx_msg),
             ("coinbase",COINBASE_WS,coinbase_open,coinbase_msg),
         ]
         for args in jobs:
-            threading.Thread(target=ws_forever,args=args,daemon=True,name=f"mx-{args[0]}").start()
-        threading.Thread(target=poster_loop,daemon=True,name="mx-poster").start()
+            venue = args[0]
+            if venue not in HEALTH:
+                mark(venue, False, "starting")
+            _spawn_thread(f"mx-{venue}", ws_forever, args)
+        _spawn_thread("mx-poster", poster_loop)
 
-if os.getenv("NEXUS_BRIDGE_AUTOSTART", "1").strip() != "0":
-    start_background()
+
+def worker_status():
+    with START_LOCK:
+        return {name: bool(t and t.is_alive()) for name, t in THREADS.items()}
+
+
+# Start on normal import, and also re-check on every health/API request.
+start_background()
 
 @app.get("/")
-def root(): return jsonify({"service":"NEXUS MULTI-EXCHANGE BRIDGE","version":VERSION,"status":"ONLINE","snapshot":snapshot()})
+def root():
+    start_background()
+    return jsonify({
+        "service":"NEXUS MULTI-EXCHANGE BRIDGE",
+        "version":VERSION,
+        "status":"ONLINE",
+        "workers":worker_status(),
+        "snapshot":snapshot(),
+    })
+
 @app.get("/healthz")
-def healthz(): return jsonify({"ok":True,"version":VERSION,"venues":snapshot().get("venues")})
+def healthz():
+    start_background()
+    snap = snapshot()
+    return jsonify({
+        "ok":True,
+        "version":VERSION,
+        "gateway_configured":bool(POST_URL),
+        "secret_configured":bool(NEXUS_SECRET),
+        "workers":worker_status(),
+        "venues":snap.get("venues"),
+    })
+
 @app.get("/api/snapshot")
-def api_snapshot(): return jsonify(snapshot())
+def api_snapshot():
+    start_background()
+    return jsonify(snapshot())
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
