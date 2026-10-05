@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: nexus-multi-exchange-bridge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bridge_app:app --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: NEXUS_MULTI_EXCHANGE_GATEWAY_URL
+        sync: false
+      - key: NEXUS_SECRET
+        sync: false
