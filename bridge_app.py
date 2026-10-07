@@ -1,16 +1,19 @@
-"""NEXUS Multi-Exchange Bridge V1.2 — Liquidity V2.
+"""NEXUS Multi-Exchange Bridge V1.4 — Liquidity V2.2.
 
 Public-data collector only. No exchange API keys and no order endpoints.
 Designed for a small always-on web service (one worker) and posts a compact
 snapshot to NEXUS every second.
 
-V1.2 keeps the existing V1.1 payload fields and adds ``liquidity_v2``:
+V1.4 keeps the existing payload fields and upgrades ``liquidity_v2``:
 - multi-depth book pressure and wall concentration
 - 3s sweep/burst detection
 - price response to aggressive flow
 - absorption and refill estimates
 - wall persistence / spoof-risk estimate
 - cross-exchange agreement, strength, quality, and confirmation eligibility
+- explicit CONFIRMED / ABSORPTION / CONFLICT / WAIT states
+- directional gate hints for Shadow V2 and reversal confirmation
+- dynamic per-venue sweep baseline derived from recent 3-second flow
 
 All Liquidity V2 outputs are support/research signals. They never place orders.
 """
@@ -30,7 +33,7 @@ import websocket
 from flask import Flask, jsonify
 
 app = Flask(__name__)
-VERSION = "1.2"
+VERSION = "1.4"
 SYMBOL = "BTC"
 POST_URL = os.getenv("NEXUS_MULTI_EXCHANGE_GATEWAY_URL", "").strip()
 NEXUS_SECRET = os.getenv("NEXUS_SECRET", "").strip()
@@ -42,6 +45,14 @@ SWEEP_MIN_USD = float(os.getenv("NEXUS_LIQ_SWEEP_MIN_USD", "250000"))
 WALL_MIN_USD = float(os.getenv("NEXUS_LIQ_WALL_MIN_USD", "100000"))
 CONFIRM_STRENGTH = float(os.getenv("NEXUS_LIQ_CONFIRM_STRENGTH", "65"))
 CONFIRM_QUALITY = float(os.getenv("NEXUS_LIQ_CONFIRM_QUALITY", "60"))
+MIN_AGREE_VENUES = int(os.getenv("NEXUS_LIQ_MIN_AGREE_VENUES", "2"))
+ABSORPTION_THRESHOLD = float(os.getenv("NEXUS_LIQ_ABSORPTION_THRESHOLD", "65"))
+CONFLICT_COMPONENT_THRESHOLD = float(os.getenv("NEXUS_LIQ_CONFLICT_COMPONENT_THRESHOLD", "0.18"))
+DYNAMIC_SWEEP_MIN_USD = float(os.getenv("NEXUS_LIQ_DYNAMIC_SWEEP_MIN_USD", "100000"))
+DYNAMIC_SWEEP_MAX_USD = float(os.getenv("NEXUS_LIQ_DYNAMIC_SWEEP_MAX_USD", "750000"))
+DYNAMIC_SWEEP_LOOKBACK_SEC = int(os.getenv("NEXUS_LIQ_DYNAMIC_SWEEP_LOOKBACK_SEC", "120"))
+DYNAMIC_SWEEP_MIN_BUCKETS = int(os.getenv("NEXUS_LIQ_DYNAMIC_SWEEP_MIN_BUCKETS", "8"))
+DYNAMIC_SWEEP_MULTIPLIER = float(os.getenv("NEXUS_LIQ_DYNAMIC_SWEEP_MULTIPLIER", "2.2"))
 
 LOCK = threading.RLock()
 EVENTS = {}
@@ -61,7 +72,7 @@ STARTED = False
 START_LOCK = threading.Lock()
 THREADS = {}
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "NEXUS-MULTI-EXCHANGE/1.2"})
+SESSION.headers.update({"User-Agent": "NEXUS-MULTI-EXCHANGE/1.4"})
 
 
 def now_ms():
@@ -561,6 +572,83 @@ def _spoof_risk(venue, seconds=10.0):
     return score, count, usd
 
 
+
+def _percentile(values, pct):
+    rows = sorted(num(x) for x in values if num(x) > 0)
+    if not rows:
+        return 0.0
+    if len(rows) == 1:
+        return rows[0]
+    pos = clamp(float(pct), 0.0, 1.0) * (len(rows) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return rows[lo]
+    frac = pos - lo
+    return rows[lo] * (1.0 - frac) + rows[hi] * frac
+
+
+def _dynamic_sweep_baseline(venue):
+    """Return a conservative per-venue 3-second sweep threshold.
+
+    We compare the current 3-second dominant-side USD flow with recent completed
+    3-second buckets. The threshold adapts to quiet/active sessions but is
+    clamped so thin periods cannot make tiny prints look like real sweeps.
+    """
+    now = time.time()
+    cutoff = now - max(30, DYNAMIC_SWEEP_LOOKBACK_SEC)
+    with LOCK:
+        rows = [
+            (ts, side, usd)
+            for ts, side, usd, _price in list(TRADE_TAPE.get(venue) or ())
+            if cutoff <= ts < now - 3.0
+        ]
+
+    buckets = []
+    # completed 3-second windows, newest first
+    windows = max(1, int(DYNAMIC_SWEEP_LOOKBACK_SEC / 3))
+    for i in range(1, windows + 1):
+        hi = now - (i * 3.0)
+        lo = hi - 3.0
+        buy = sell = 0.0
+        for ts, side, usd in rows:
+            if lo <= ts < hi:
+                if side == "BUY":
+                    buy += usd
+                elif side == "SELL":
+                    sell += usd
+        dominant = max(buy, sell)
+        if dominant > 0:
+            buckets.append(dominant)
+
+    if len(buckets) < DYNAMIC_SWEEP_MIN_BUCKETS:
+        return {
+            "mode": "WARMUP",
+            "threshold_usd": float(SWEEP_MIN_USD),
+            "baseline_usd": 0.0,
+            "median_usd": 0.0,
+            "p75_usd": 0.0,
+            "samples": len(buckets),
+        }
+
+    median = statistics.median(buckets)
+    p75 = _percentile(buckets, 0.75)
+
+    # The p75 term reacts to recent activity; median protects against a few
+    # isolated bursts distorting the baseline.
+    baseline = max(median * DYNAMIC_SWEEP_MULTIPLIER, p75 * 1.45)
+    threshold = max(DYNAMIC_SWEEP_MIN_USD, min(DYNAMIC_SWEEP_MAX_USD, baseline))
+
+    return {
+        "mode": "DYNAMIC",
+        "threshold_usd": float(threshold),
+        "baseline_usd": float(baseline),
+        "median_usd": float(median),
+        "p75_usd": float(p75),
+        "samples": len(buckets),
+    }
+
+
 def venue_liquidity_v2(venue):
     now = time.time()
     with LOCK:
@@ -583,13 +671,15 @@ def venue_liquidity_v2(venue):
     dominant_side = "BUY" if buy3 >= sell3 else "SELL"
     dominant3 = max(buy3, sell3)
     dominant_share = dominant3 / total3 if total3 else 0.0
-    expected3 = max(SWEEP_MIN_USD, (total60 / 60.0) * 3.0) if total60 else SWEEP_MIN_USD
+    sweep_baseline = _dynamic_sweep_baseline(venue)
+    dynamic_threshold = max(1.0, num(sweep_baseline.get("threshold_usd"), SWEEP_MIN_USD))
+    expected3 = max(dynamic_threshold, (total60 / 60.0) * 3.0) if total60 else dynamic_threshold
     burst_ratio = dominant3 / expected3 if expected3 > 0 else 0.0
 
     sweep_strength = 0.0
-    if dominant3 >= SWEEP_MIN_USD and dominant_share >= 0.60:
+    if dominant3 >= dynamic_threshold and dominant_share >= 0.60:
         share_score = clamp((dominant_share - 0.50) / 0.50)
-        size_score = clamp(math.log1p(dominant3 / SWEEP_MIN_USD) / math.log(5.0))
+        size_score = clamp(math.log1p(dominant3 / dynamic_threshold) / math.log(5.0))
         burst_score = clamp(burst_ratio / 2.5)
         sweep_strength = (35.0 * share_score) + (35.0 * size_score) + (30.0 * burst_score)
 
@@ -657,6 +747,12 @@ def venue_liquidity_v2(venue):
             "burst_ratio": round(burst_ratio, 3),
             "price_response_bps": round(signed_response, 3),
             "persistence": round(persistence, 3),
+            "threshold_usd": round(dynamic_threshold, 2),
+            "threshold_mode": sweep_baseline.get("mode"),
+            "baseline_usd": round(num(sweep_baseline.get("baseline_usd")), 2),
+            "baseline_median_usd": round(num(sweep_baseline.get("median_usd")), 2),
+            "baseline_p75_usd": round(num(sweep_baseline.get("p75_usd")), 2),
+            "baseline_samples": int(num(sweep_baseline.get("samples"), 0)),
         },
         "absorption": {
             "score": round(clamp(absorption, 0.0, 100.0), 1),
@@ -681,33 +777,67 @@ def venue_liquidity_v2(venue):
     }
 
 
+def _dir_from_score(score, threshold=0.12):
+    score = num(score)
+    if score >= threshold:
+        return "UP"
+    if score <= -threshold:
+        return "DOWN"
+    return "NEUTRAL"
+
+
+def _opposite(direction):
+    return "DOWN" if direction == "UP" else ("UP" if direction == "DOWN" else "NEUTRAL")
+
+
 def liquidity_v2_snapshot():
+    """Aggregate Liquidity V2.1 into an explicit confirmation state.
+
+    State meanings:
+      CONFIRMED  - direction/quality/strength and venue agreement are sufficient.
+      ABSORPTION - aggressive sweep is being absorbed; do not chase the sweep.
+      CONFLICT   - meaningful components disagree; block fresh confirmation.
+      WAIT       - not enough clean evidence yet.
+
+    This is support-only telemetry. It never places an order.
+    """
     with LOCK:
         venues = sorted(set(list(BOOKS) + list(PRICES) + list(HEALTH) + list(TRADE_TAPE)))
 
     details = {v: venue_liquidity_v2(v) for v in venues}
-    healthy = [x for x in details.values() if x.get("healthy")]
-    healthy_names = [v for v, x in details.items() if x.get("healthy")]
+    healthy_items = [(v, x) for v, x in details.items() if x.get("healthy")]
+    healthy = [x for _, x in healthy_items]
+    healthy_names = [v for v, _ in healthy_items]
 
     if not healthy:
         return {
-            "version": "2.0",
+            "version": "2.2",
             "status": "OFFLINE",
+            "state": "WAIT",
             "direction": "NEUTRAL",
+            "confirmation_direction": "NEUTRAL",
+            "absorption_bias": "NEUTRAL",
             "strength": 0.0,
             "quality": 0.0,
             "agreement": 0.0,
+            "agreeing_venues": 0,
             "healthy_venues": 0,
             "confirmation_eligible": False,
+            "gate": "HOLD",
             "reason": "no fresh healthy venues",
+            "component_directions": {
+                "aggregate": "NEUTRAL", "book": "NEUTRAL",
+                "flow": "NEUTRAL", "sweep": "NEUTRAL",
+            },
             "venues": details,
         }
 
     weights = [max(0.20, num(x.get("quality")) / 100.0) for x in healthy]
     wsum = sum(weights) or 1.0
     global_score = sum(num(x.get("score")) * w for x, w in zip(healthy, weights)) / wsum
-    global_direction = "UP" if global_score >= 0.12 else ("DOWN" if global_score <= -0.12 else "NEUTRAL")
+    global_direction = _dir_from_score(global_score)
 
+    # Cross-venue directional agreement.
     if global_direction == "NEUTRAL":
         agreeing = sum(1 for x in healthy if x.get("direction") == "NEUTRAL")
     else:
@@ -717,6 +847,12 @@ def liquidity_v2_snapshot():
     avg_quality = sum(num(x.get("quality")) for x in healthy) / len(healthy)
     avg_persistence = sum(num((x.get("sweep") or {}).get("persistence")) for x in healthy) / len(healthy)
     avg_spoof = sum(num((x.get("spoof_risk") or {}).get("score")) for x in healthy) / len(healthy)
+
+    # Independent components used to detect internal conflict.
+    book_score = sum(num(x.get("weighted_book_imbalance")) * w for x, w in zip(healthy, weights)) / wsum
+    flow_score = sum(num(x.get("flow_15s_ratio")) * w for x, w in zip(healthy, weights)) / wsum
+    book_direction = _dir_from_score(book_score, CONFLICT_COMPONENT_THRESHOLD)
+    flow_direction = _dir_from_score(flow_score, CONFLICT_COMPONENT_THRESHOLD)
 
     strength = clamp(abs(global_score) * 0.78 + agreement * 0.22, 0.0, 1.0) * 100.0
     quality = clamp(
@@ -730,9 +866,7 @@ def liquidity_v2_snapshot():
 
     sweeps = []
     absorptions = []
-    for venue, x in details.items():
-        if not x.get("healthy"):
-            continue
+    for venue, x in healthy_items:
         sw = x.get("sweep") or {}
         ab = x.get("absorption") or {}
         if num(sw.get("strength")) > 0:
@@ -742,46 +876,136 @@ def liquidity_v2_snapshot():
     sweeps.sort(reverse=True, key=lambda x: x[0])
     absorptions.sort(reverse=True, key=lambda x: x[0])
 
-    eligible = (
-        len(healthy) >= 3
+    strongest_sweep = ({"venue": sweeps[0][1], **sweeps[0][2]} if sweeps else None)
+    strongest_absorption = ({"venue": absorptions[0][1], **absorptions[0][2]} if absorptions else None)
+
+    sweep_direction = "NEUTRAL"
+    if strongest_sweep and num(strongest_sweep.get("strength")) >= 45:
+        sweep_direction = "UP" if str(strongest_sweep.get("side")).upper() == "BUY" else "DOWN"
+
+    absorption_score = num((strongest_absorption or {}).get("score"))
+    absorption_active = bool(
+        strongest_sweep
+        and strongest_absorption
+        and absorption_score >= ABSORPTION_THRESHOLD
+        and num(strongest_sweep.get("strength")) >= 45
+    )
+    # A BUY sweep being absorbed is bearish risk; a SELL sweep being absorbed is bullish risk.
+    absorption_bias = _opposite(sweep_direction) if absorption_active else "NEUTRAL"
+
+    component_directions = {
+        "aggregate": global_direction,
+        "book": book_direction,
+        "flow": flow_direction,
+        "sweep": sweep_direction,
+    }
+    directional_components = [
+        d for d in component_directions.values() if d in ("UP", "DOWN")
+    ]
+    has_up = "UP" in directional_components
+    has_down = "DOWN" in directional_components
+
+    # Only call CONFLICT when both sides have meaningful independent evidence.
+    conflict = has_up and has_down
+    conflict_reasons = []
+    if conflict:
+        if book_direction not in ("NEUTRAL", global_direction):
+            conflict_reasons.append(f"book {book_direction} vs aggregate {global_direction}")
+        if flow_direction not in ("NEUTRAL", global_direction):
+            conflict_reasons.append(f"flow {flow_direction} vs aggregate {global_direction}")
+        if sweep_direction not in ("NEUTRAL", global_direction):
+            conflict_reasons.append(f"sweep {sweep_direction} vs aggregate {global_direction}")
+        if not conflict_reasons:
+            conflict_reasons.append("directional components disagree")
+
+    base_eligible = (
+        len(healthy) >= 2
         and global_direction in ("UP", "DOWN")
         and strength >= CONFIRM_STRENGTH
         and quality >= CONFIRM_QUALITY
+        and agreeing >= MIN_AGREE_VENUES
         and agreement >= 0.50
     )
 
+    if absorption_active:
+        state = "ABSORPTION"
+        confirmation_direction = "NEUTRAL"
+        gate = "BLOCK_NEW"
+    elif conflict:
+        state = "CONFLICT"
+        confirmation_direction = "NEUTRAL"
+        gate = "BLOCK_NEW"
+    elif base_eligible:
+        state = "CONFIRMED"
+        confirmation_direction = global_direction
+        gate = "ALLOW_UP" if global_direction == "UP" else "ALLOW_DOWN"
+    else:
+        state = "WAIT"
+        confirmation_direction = "NEUTRAL"
+        gate = "HOLD"
+
+    confirmation_eligible = state == "CONFIRMED"
+
     reasons = []
-    if len(healthy) < 3:
-        reasons.append("need 3+ fresh venues")
-    if global_direction == "NEUTRAL":
-        reasons.append("direction neutral")
-    if strength < CONFIRM_STRENGTH:
-        reasons.append(f"strength {strength:.0f}<{CONFIRM_STRENGTH:.0f}")
-    if quality < CONFIRM_QUALITY:
-        reasons.append(f"quality {quality:.0f}<{CONFIRM_QUALITY:.0f}")
-    if agreement < 0.50:
-        reasons.append("cross-venue disagreement")
+    if state == "CONFIRMED":
+        reasons.append(
+            f"{confirmation_direction} confirmed: {agreeing}/{len(healthy)} venues agree"
+        )
+    elif state == "ABSORPTION":
+        reasons.append(
+            f"{sweep_direction} sweep absorbed; {absorption_bias} reversal risk"
+        )
+    elif state == "CONFLICT":
+        reasons.extend(conflict_reasons)
+    else:
+        if len(healthy) < 2:
+            reasons.append("need 2+ fresh venues")
+        if global_direction == "NEUTRAL":
+            reasons.append("direction neutral")
+        if strength < CONFIRM_STRENGTH:
+            reasons.append(f"strength {strength:.0f}<{CONFIRM_STRENGTH:.0f}")
+        if quality < CONFIRM_QUALITY:
+            reasons.append(f"quality {quality:.0f}<{CONFIRM_QUALITY:.0f}")
+        if agreeing < MIN_AGREE_VENUES:
+            reasons.append(f"need {MIN_AGREE_VENUES}+ agreeing venues")
+        if agreement < 0.50:
+            reasons.append("cross-venue disagreement")
 
     return {
-        "version": "2.0",
+        "version": "2.2",
         "status": "LIVE",
+        "state": state,
         "direction": global_direction,
+        "confirmation_direction": confirmation_direction,
+        "absorption_bias": absorption_bias,
         "score": round(global_score, 4),
         "strength": round(strength, 1),
         "quality": round(quality, 1),
         "agreement": round(agreement, 3),
+        "agreeing_venues": int(agreeing),
         "healthy_venues": len(healthy),
         "healthy_venue_names": healthy_names,
-        "confirmation_eligible": bool(eligible),
+        "confirmation_eligible": bool(confirmation_eligible),
+        "gate": gate,
         "confirmation_thresholds": {
             "strength": CONFIRM_STRENGTH,
             "quality": CONFIRM_QUALITY,
-            "min_healthy_venues": 3,
+            "min_healthy_venues": 2,
+            "min_agreeing_venues": MIN_AGREE_VENUES,
             "min_agreement": 0.50,
+            "absorption_score": ABSORPTION_THRESHOLD,
         },
-        "reason": "eligible" if eligible else "; ".join(reasons),
-        "strongest_sweep": ({"venue": sweeps[0][1], **sweeps[0][2]} if sweeps else None),
-        "strongest_absorption": ({"venue": absorptions[0][1], **absorptions[0][2]} if absorptions else None),
+        "component_scores": {
+            "aggregate": round(global_score, 4),
+            "book": round(book_score, 4),
+            "flow": round(flow_score, 4),
+        },
+        "component_directions": component_directions,
+        "conflict": bool(conflict),
+        "conflict_reasons": conflict_reasons,
+        "reason": "; ".join(reasons) if reasons else state.lower(),
+        "strongest_sweep": strongest_sweep,
+        "strongest_absorption": strongest_absorption,
         "venues": details,
     }
 
